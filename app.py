@@ -2,7 +2,9 @@
 import streamlit as st
 import cv2
 import numpy as np
+import json
 from calc import MinimalSafeHeight
+from streamlit_drawable_canvas import st_canvas
 
 # Настройка страницы
 st.set_page_config(page_title="Расчёт безопасных высот", layout="wide")
@@ -25,6 +27,14 @@ with st.sidebar:
     MAX_HEIGHT_PHYS = st.number_input("Максимальная высота на местности (м)", value=1000.0, step=100.0)
     ANGLE = st.number_input("Угол оси ВПП (градусы)", value=90.0, step=1.0)
 
+# Инициализация session_state
+if 'points' not in st.session_state:
+    st.session_state.points = []
+if 'analysis_done' not in st.session_state:
+    st.session_state.analysis_done = False
+if 'obstacle_height' not in st.session_state:
+    st.session_state.obstacle_height = 0
+
 # Основная область – загрузка карты и вызов анализа
 st.header("Загрузка карты высот")
 uploaded_file = st.file_uploader("Выберите изображение карты (PNG, JPG)", type=["png", "jpg", "jpeg"])
@@ -33,67 +43,113 @@ if uploaded_file is not None:
     # Загружаем изображение в numpy array
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
+    img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
     
-    st.image(img, caption="Загруженная карта", use_container_width=True)
+    st.write(f"**Размер изображения: {w}x{h} пикселей**")
     
-    # Инструкция по выбору точек
-    st.info(f"""
-    **Размер изображения: {w}x{h} пикселей**
-    
-    Кликните по карте, чтобы выбрать:
-    1. **Первую точку** – порог ВПП
-    2. **Вторую точку** – конец оси ВПП
-    """)
-    
-    # Интерактивный выбор точек через streamlit-drawable-canvas или координатами
-    col1, col2 = st.columns(2)
+    col1, col2 = st.columns([2, 1])
     
     with col1:
-        st.subheader("Координаты точек")
-        x1 = st.number_input("X1 (порог ВПП)", min_value=0, max_value=w-1, value=w//4)
-        y1 = st.number_input("Y1 (порог ВПП)", min_value=0, max_value=h-1, value=h//2)
-        x2 = st.number_input("X2 (конец оси)", min_value=0, max_value=w-1, value=3*w//4)
-        y2 = st.number_input("Y2 (конец оси)", min_value=0, max_value=h-1, value=h//2)
+        st.subheader("Выберите точки на карте")
+        st.info("""
+        **Инструкция:**
+        1. Кликните **первой точкой** на порог ВПП (красный маркер появится автоматически)
+        2. Кликните **второй точкой** на конец оси ВПП (синий маркер)
+        3. Нажмите '🚀 Рассчитать высоту'
+        
+        *Для исправления: нажмите 'Сбросить точки' и выберите заново*
+        """)
+        
+        # Canvas для интерактивного выбора точек
+        canvas_result = st_canvas(
+            fill_color="rgba(255, 0, 0, 0.5)",
+            stroke_width=3,
+            stroke_color="#00FF00",
+            background_image=uploaded_file,
+            height=min(h, 600),
+            width=min(w, 800),
+            drawing_mode="point",
+            key="canvas",
+            display_toolbar=True
+        )
     
     with col2:
+        st.subheader("Управление")
+        
+        # Обработка точек с canvas
+        if canvas_result.json_data is not None:
+            objects = canvas_result.json_data.get("objects", [])
+            points = []
+            for obj in objects:
+                if obj.get("type") == "circle":
+                    x = int(obj.get("left", 0))
+                    y = int(obj.get("top", 0))
+                    # Масштабирование координат если canvas меньше оригинала
+                    scale_x = w / min(w, 800)
+                    scale_y = h / min(h, 600)
+                    points.append((int(x * scale_x), int(y * scale_y)))
+            
+            st.session_state.points = points
+        
+        if len(st.session_state.points) >= 1:
+            st.success(f"✅ Точка 1 (порог ВПП): {st.session_state.points[0]}")
+        if len(st.session_state.points) >= 2:
+            st.success(f"✅ Точка 2 (конец оси): {st.session_state.points[1]}")
+        
         if st.button("🚀 Рассчитать высоту"):
-            first_point = (x1, y1)
-            second_point = (x2, y2)
-            
-            # Расчёт максимальной высоты вдоль линии
-            dx = x2 - x1
-            dy = y2 - y1
-            length = int(np.hypot(dx, dy))
-            max_val = 0.0
-            
-            for t in np.linspace(0, 1, max(1, length)):
-                xi = int(x1 + t * dx)
-                yi = int(y1 + t * dy)
-                if 0 <= xi < w and 0 <= yi < h:
-                    brightness = img_gray[yi, xi]
-                    height = (brightness / 255.0) * MAX_HEIGHT_PHYS
-                    if height > max_val:
-                        max_val = height
-            
-            st.session_state['obstacle_height'] = max_val
-            st.session_state['analysis_done'] = True
-            st.session_state['first_point'] = first_point
-            st.session_state['second_point'] = second_point
-            
-            st.success(f"Максимальная высота препятствия: **{max_val:.2f} м**")
+            if len(st.session_state.points) >= 2:
+                first_point = st.session_state.points[0]
+                second_point = st.session_state.points[1]
+                
+                # Расчёт максимальной высоты вдоль линии
+                dx = second_point[0] - first_point[0]
+                dy = second_point[1] - first_point[1]
+                length = int(np.hypot(dx, dy))
+                max_val = 0.0
+                
+                for t in np.linspace(0, 1, max(1, length)):
+                    xi = int(first_point[0] + t * dx)
+                    yi = int(first_point[1] + t * dy)
+                    if 0 <= xi < w and 0 <= yi < h:
+                        brightness = img_gray[yi, xi]
+                        height = (brightness / 255.0) * MAX_HEIGHT_PHYS
+                        if height > max_val:
+                            max_val = height
+                
+                st.session_state.obstacle_height = max_val
+                st.session_state.analysis_done = True
+                st.session_state.first_point = first_point
+                st.session_state.second_point = second_point
+                st.session_state.max_height = max_val
+                
+                st.success(f"Максимальная высота препятствия: **{max_val:.2f} м**")
+            else:
+                st.error("❌ Выберите обе точки на карте!")
+        
+        if st.button("🔄 Сбросить точки"):
+            st.session_state.points = []
+            st.session_state.analysis_done = False
+            st.rerun()
     
-    # Визуализация линии
-    if st.session_state.get('analysis_done'):
-        vis_img = img.copy()
-        cv2.line(vis_img, st.session_state['first_point'], st.session_state['second_point'], (0, 255, 0), 2)
-        cv2.circle(vis_img, st.session_state['first_point'], 8, (0, 0, 255), -1)
-        cv2.circle(vis_img, st.session_state['second_point'], 8, (255, 0, 0), -1)
-        st.image(vis_img, caption="Выбранная ось ВПП", use_container_width=True)
+    # Визуализация выбранной оси
+    if st.session_state.get('analysis_done') and len(st.session_state.points) >= 2:
+        st.subheader("📍 Выбранная ось ВПП")
+        vis_img = img_rgb.copy()
+        p1 = st.session_state.first_point
+        p2 = st.session_state.second_point
+        
+        # Рисуем линию
+        cv2.line(vis_img, p1, p2, (0, 255, 0), 3)
+        cv2.circle(vis_img, p1, 10, (255, 0, 0), -1)  # Красная (BGR)
+        cv2.circle(vis_img, p2, 10, (0, 0, 255), -1)  # Синяя (BGR)
+        
+        st.image(vis_img, caption="Ось ВПП (красная = порог, синяя = конец, зелёная = ось)", use_container_width=True)
+        st.write(f"**Длина оси:** {int(np.hypot(p2[0]-p1[0], p2[1]-p1[1]))} пикселей")
 
 # Если есть данные анализа, выполняем расчёт
-if st.session_state.get('analysis_done'):
+if st.session_state.get('analysis_done') and st.session_state.get('obstacle_height', 0) > 0:
     st.header("📊 Результат расчёта")
 
     H_obstcl = st.session_state['obstacle_height']
@@ -127,7 +183,8 @@ if st.session_state.get('analysis_done'):
         else:
             st.latex(r"H_{\text{QNH}} = H_{\text{преп}} + МЗВ + \Delta H_t")
 else:
-    st.info("Загрузите карту и выберите точки для расчёта.")
+    if uploaded_file is not None:
+        st.info("👆 Выберите точки на карте и нажмите 'Рассчитать высоту'")
 
 # Инструкция внизу
 st.markdown("---")
@@ -135,7 +192,7 @@ st.markdown("""
 **Инструкция:**
 1. Задайте параметры аэродрома и карты в боковой панели.
 2. Загрузите изображение карты высот (градиент от чёрного (0) до белого (макс. высота)).
-3. Введите координаты точек ВПП (или используйте значения по умолчанию).
-4. Нажмите "Рассчитать высоту".
+3. Кликните по карте: первая точка – порог ВПП, вторая точка – конец оси ВПП.
+4. Нажмите "🚀 Рассчитать высоту".
 5. Получите результат расчёта минимальной безопасной высоты.
 """)
