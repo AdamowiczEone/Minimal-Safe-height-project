@@ -2,17 +2,15 @@
 import streamlit as st
 import cv2
 import numpy as np
-import json
 from PIL import Image
-from io import BytesIO
+from streamlit_image_coordinates import streamlit_image_coordinates
 from calc import MinimalSafeHeight
-from streamlit_drawable_canvas import st_canvas
 
 # Настройка страницы
 st.set_page_config(page_title="Расчёт безопасных высот", layout="wide")
 st.title("🛩️ Расчёт минимальных безопасных высот (QFE / QNH)")
 
-# Боковая панель для ввода параметров
+# Боковая панель
 with st.sidebar:
     st.header("Параметры расчёта")
     formula_type = st.radio("Тип высоты", ["QFE (относительная)", "QNH (абсолютная)"])
@@ -30,127 +28,223 @@ with st.sidebar:
     ANGLE = st.number_input("Угол оси ВПП (градусы)", value=90.0, step=1.0)
 
 # Инициализация session_state
-if 'points' not in st.session_state:
-    st.session_state.points = []
+if 'first_point' not in st.session_state:
+    st.session_state.first_point = None
+if 'second_point' not in st.session_state:
+    st.session_state.second_point = None
 if 'analysis_done' not in st.session_state:
     st.session_state.analysis_done = False
 if 'obstacle_height' not in st.session_state:
     st.session_state.obstacle_height = 0
+if 'max_height_result' not in st.session_state:
+    st.session_state.max_height_result = 0
+if 'click_key_counter' not in st.session_state:
+    st.session_state.click_key_counter = 0
+if 'last_coord' not in st.session_state:
+    st.session_state.last_coord = None
 
-# Основная область – загрузка карты и вызов анализа
+# =============================================================================
+# ЛОГИКА ИЗ cv2_selector.py (та же самая функция!)
+# =============================================================================
+
+def calculate_max_height(img_gray, first_point, second_point, max_height_phys):
+    """
+    Calculate maximum height along the line between two points.
+    Логика полностью из cv2_selector.py
+    """
+    dx = second_point[0] - first_point[0]
+    dy = second_point[1] - first_point[1]
+    length = int(np.hypot(dx, dy))
+    max_val = 0.0
+
+    for t in np.linspace(0, 1, max(1, length)):
+        xi = int(first_point[0] + t * dx)
+        yi = int(first_point[1] + t * dy)
+        if 0 <= xi < img_gray.shape[1] and 0 <= yi < img_gray.shape[0]:
+            brightness = img_gray[yi, xi]
+            height = (brightness / 255.0) * max_height_phys
+            if height > max_val:
+                max_val = height
+
+    return max_val
+
+def reset_points():
+    st.session_state.first_point = None
+    st.session_state.second_point = None
+    st.session_state.analysis_done = False
+    st.session_state.obstacle_height = 0
+    st.session_state.max_height_result = 0
+    st.session_state.click_key_counter = 0
+    st.session_state.last_coord = None
+
+# =============================================================================
+# ОСНОВНАЯ ЧАСТЬ
+# =============================================================================
+
 st.header("Загрузка карты высот")
 uploaded_file = st.file_uploader("Выберите изображение карты (PNG, JPG)", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
-    # Загружаем изображение в numpy array для OpenCV
+    # Загружаем изображение (как в cv2_selector)
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
-    
-    # Создаём PIL Image для canvas
-    pil_img = Image.open(BytesIO(uploaded_file.getvalue()))
-    
-    st.write(f"**Размер изображения: {w}x{h} пикселей**")
-    
-    col1, col2 = st.columns([2, 1])
-    
-    with col1:
-        st.subheader("Выберите точки на карте")
-        st.info("""
-        **Инструкция:**
-        1. Кликните **первой точкой** на порог ВПП (красный маркер появится автоматически)
-        2. Кликните **второй точкой** на конец оси ВПП (синий маркер)
-        3. Нажмите '🚀 Рассчитать высоту'
-        
-        *Для исправления: нажмите 'Сбросить точки' и выберите заново*
-        """)
-        
-        # Canvas для интерактивного выбора точек
-        canvas_result = st_canvas(
-            fill_color="rgba(255, 0, 0, 0.5)",
-            stroke_width=3,
-            stroke_color="#00FF00",
-            background_image=pil_img,
-            height=h,
-            width=w,
-            drawing_mode="point",
-            key="canvas",
-            display_toolbar=True
-        )
-    
-    with col2:
-        st.subheader("Управление")
-        
-        # Обработка точек с canvas
-        if canvas_result.json_data is not None:
-            objects = canvas_result.json_data.get("objects", [])
-            points = []
-            for obj in objects:
-                if obj.get("type") == "circle":
-                    x = int(obj.get("left", 0))
-                    y = int(obj.get("top", 0))
-                    points.append((x, y))
-            
-            st.session_state.points = points
-        
-        if len(st.session_state.points) >= 1:
-            st.success(f"✅ Точка 1 (порог ВПП): {st.session_state.points[0]}")
-        if len(st.session_state.points) >= 2:
-            st.success(f"✅ Точка 2 (конец оси): {st.session_state.points[1]}")
-        
-        if st.button("🚀 Рассчитать высоту"):
-            if len(st.session_state.points) >= 2:
-                first_point = st.session_state.points[0]
-                second_point = st.session_state.points[1]
-                
-                # Расчёт максимальной высоты вдоль линии
-                dx = second_point[0] - first_point[0]
-                dy = second_point[1] - first_point[1]
-                length = int(np.hypot(dx, dy))
-                max_val = 0.0
-                
-                for t in np.linspace(0, 1, max(1, length)):
-                    xi = int(first_point[0] + t * dx)
-                    yi = int(first_point[1] + t * dy)
-                    if 0 <= xi < w and 0 <= yi < h:
-                        brightness = img_gray[yi, xi]
-                        height = (brightness / 255.0) * MAX_HEIGHT_PHYS
-                        if height > max_val:
-                            max_val = height
-                
-                st.session_state.obstacle_height = max_val
-                st.session_state.analysis_done = True
-                st.session_state.first_point = first_point
-                st.session_state.second_point = second_point
-                st.session_state.max_height = max_val
-                
-                st.success(f"Максимальная высота препятствия: **{max_val:.2f} м**")
-            else:
-                st.error("❌ Выберите обе точки на карте!")
-        
-        if st.button("🔄 Сбросить точки"):
-            st.session_state.points = []
-            st.session_state.analysis_done = False
-            st.rerun()
-    
-    # Визуализация выбранной оси
-    if st.session_state.get('analysis_done') and len(st.session_state.points) >= 2:
-        st.subheader("📍 Выбранная ось ВПП")
-        vis_img = img_rgb.copy()
-        p1 = st.session_state.first_point
-        p2 = st.session_state.second_point
-        
-        # Рисуем линию
-        cv2.line(vis_img, p1, p2, (0, 255, 0), 3)
-        cv2.circle(vis_img, p1, 10, (255, 0, 0), -1)  # Красная (BGR)
-        cv2.circle(vis_img, p2, 10, (0, 0, 255), -1)  # Синяя (BGR)
-        
-        st.image(vis_img, caption="Ось ВПП (красная = порог, синяя = конец, зелёная = ось)", use_container_width=True)
-        st.write(f"**Длина оси:** {int(np.hypot(p2[0]-p1[0], p2[1]-p1[1]))} пикселей")
 
-# Если есть данные анализа, выполняем расчёт
+    st.write(f"**Размер изображения: {w}x{h} пикселей**")
+
+    # Инструкция (как в cv2_selector)
+    if st.session_state.first_point is None:
+        st.info("""
+        **👆 Инструкция (как в cv2_selector):**
+        1. **Кликните по изображению** для выбора первой точки (порог ВПП)
+        2. **Кликните ещё раз** для выбора второй точки (конец оси)
+        3. Расчёт выполнится автоматически
+        
+        *Красная сетка помогает ориентироваться*
+        """)
+    elif st.session_state.second_point is None:
+        st.info(f"""
+        ✅ **Точка 1 выбрана:** {st.session_state.first_point}
+        
+        **👆 Кликните по изображению** для выбора второй точки (конец оси)
+        """)
+    else:
+        st.info("✅ **Обе точки выбраны!** Расчёт выполнен.")
+
+    # =============================================================================
+    # РИСУЕМ СЕТКУ (как в cv2_selector.py для web mode)
+    # =============================================================================
+    
+    grid_img = img.copy()
+    step = max(50, min(100, w // 10))  # Адаптивный шаг как в cv2_selector
+
+    # Рисуем сетку (точно как в cv2_selector.py)
+    for x in range(0, w, step):
+        cv2.line(grid_img, (x, 0), (x, h), (255, 0, 0), 1)
+    for y in range(0, h, step):
+        cv2.line(grid_img, (0, y), (w, y), (255, 0, 0), 1)
+
+    # Рисуем выбранную первую точку (как в cv2_selector)
+    if st.session_state.first_point:
+        x, y = st.session_state.first_point
+        cv2.circle(grid_img, (x, y), 8, (0, 0, 255), -1)  # Красная (BGR)
+        cv2.putText(grid_img, "Base", (x+5, y-5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
+
+    # Рисуем вторую точку и линию (как в cv2_selector)
+    if st.session_state.second_point:
+        x, y = st.session_state.second_point
+        cv2.circle(grid_img, (x, y), 8, (255, 0, 0), -1)  # Синяя (BGR)
+        cv2.putText(grid_img, "End", (x+5, y-5), 
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1)
+        
+        # Рисуем линию между точками
+        cv2.line(grid_img, st.session_state.first_point, st.session_state.second_point, (0, 255, 0), 1)
+
+    # =============================================================================
+    # ИНТЕРАКТИВНОЕ ИЗОБРАЖЕНИЕ С КЛИКАМИ (веб-аналог cv2.setMouseCallback)
+    # =============================================================================
+
+    st.subheader("Карта с сеткой")
+
+    # Уникальный ключ для каждого "состояния" кликов — предотвращает ложные срабатывания
+    click_key = f"click_selector_{st.session_state.click_key_counter}"
+
+    # streamlit_image_coordinates — веб-аналог setMouseCallback
+    coord = streamlit_image_coordinates(
+        Image.fromarray(cv2.cvtColor(grid_img, cv2.COLOR_BGR2RGB)),
+        key=click_key
+    )
+
+    # Обработка клика (аналог mouse_callback в cv2_selector)
+    # Проверяем что координаты изменились — защита от ложных срабатываний
+    if coord and coord != st.session_state.last_coord:
+        x = coord['x']
+        y = coord['y']
+        clicked_point = (x, y)
+
+        # Сохраняем последние координаты чтобы не обрабатывать дважды
+        st.session_state.last_coord = coord
+
+        if st.session_state.first_point is None:
+            # Первый клик — базовая точка (как в cv2_selector)
+            st.session_state.first_point = clicked_point
+            st.session_state.click_key_counter += 1  # Меняем ключ для следующего клика
+            st.success(f"✅ Базовая точка (порог ВПП): {clicked_point}")
+            st.rerun()
+        elif st.session_state.second_point is None:
+            # Второй клик — конечная точка (как в cv2_selector)
+            st.session_state.second_point = clicked_point
+            st.session_state.click_key_counter += 1  # Меняем ключ
+            st.success(f"✅ Конечная точка: {clicked_point}")
+
+            # РАСЧЁТ (логика из cv2_selector.py)
+            max_height = calculate_max_height(
+                img_gray,
+                st.session_state.first_point,
+                st.session_state.second_point,
+                MAX_HEIGHT_PHYS
+            )
+            st.session_state.max_height_result = max_height
+            st.session_state.obstacle_height = max_height
+            st.session_state.analysis_done = True
+
+            st.success(f"**Максимальная высота на линии: {max_height:.2f} м**")
+            st.rerun()
+        else:
+            # Уже есть обе точки — сбрасываем и начинаем заново
+            st.info("🔄 Точки уже выбраны. Сбрасываю для нового выбора...")
+            reset_points()
+            st.session_state.first_point = clicked_point
+            st.session_state.click_key_counter += 1
+            st.rerun()
+
+    # =============================================================================
+    # ПАНЕЛЬ УПРАВЛЕНИЯ
+    # =============================================================================
+    
+    st.subheader("Управление")
+    col1, col2, col3 = st.columns(3)
+
+    with col1:
+        st.write(f"**Точка 1 (порог):** {st.session_state.first_point}")
+    with col2:
+        st.write(f"**Точка 2 (конец):** {st.session_state.second_point}")
+    with col3:
+        if st.button("🔄 Сбросить точки"):
+            reset_points()
+            st.rerun()
+
+    # =============================================================================
+    # ВИЗУАЛИЗАЦИЯ (как в cv2_selector после выбора)
+    # =============================================================================
+    
+    if st.session_state.first_point and st.session_state.second_point:
+        st.subheader("📍 Выбранная ось ВПП")
+        
+        vis_img = img.copy()
+        
+        # Рисуем линию (как в cv2_selector)
+        cv2.line(vis_img, st.session_state.first_point, st.session_state.second_point, (0, 255, 0), 2)
+        cv2.circle(vis_img, st.session_state.first_point, 8, (0, 0, 255), -1)
+        cv2.circle(vis_img, st.session_state.second_point, 8, (255, 0, 0), -1)
+        
+        # Длина оси
+        dx = st.session_state.second_point[0] - st.session_state.first_point[0]
+        dy = st.session_state.second_point[1] - st.session_state.first_point[1]
+        length = int(np.hypot(dx, dy))
+        
+        st.image(cv2.cvtColor(vis_img, cv2.COLOR_BGR2RGB), 
+                 caption="Ось ВПП (красная = порог, синяя = конец, зелёная = ось)",
+                 use_container_width=True)
+        st.write(f"**Длина оси:** {length} пикселей")
+
+# =============================================================================
+# РАСЧЁТ (как в оригинальном приложении)
+# =============================================================================
+
 if st.session_state.get('analysis_done') and st.session_state.get('obstacle_height', 0) > 0:
     st.header("📊 Результат расчёта")
 
@@ -184,17 +278,17 @@ if st.session_state.get('analysis_done') and st.session_state.get('obstacle_heig
             st.latex(r"H_{\text{QFE}} = (H_{\text{преп}} - H_{\text{аэр}}) + МЗВ + \Delta H_t")
         else:
             st.latex(r"H_{\text{QNH}} = H_{\text{преп}} + МЗВ + \Delta H_t")
-else:
-    if uploaded_file is not None:
-        st.info("👆 Выберите точки на карте и нажмите 'Рассчитать высоту'")
 
-# Инструкция внизу
+# =============================================================================
+# ИНСТРУКЦИЯ
+# =============================================================================
+
 st.markdown("---")
 st.markdown("""
-**Инструкция:**
-1. Задайте параметры аэродрома и карты в боковой панели.
-2. Загрузите изображение карты высот (градиент от чёрного (0) до белого (макс. высота)).
-3. Кликните по карте: первая точка – порог ВПП, вторая точка – конец оси ВПП.
-4. Нажмите "🚀 Рассчитать высоту".
-5. Получите результат расчёта минимальной безопасной высоты.
+**Инструкция (аналог cv2_selector):**
+1. Задайте параметры в боковой панели.
+2. Загрузите изображение карты высот.
+3. **Кликните по изображению** для выбора первой точки (порог ВПП).
+4. **Кликните ещё раз** для выбора второй точки (конец оси).
+5. Расчёт выполнится автоматически — как в cv2_selector.py!
 """)
