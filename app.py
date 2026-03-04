@@ -3,6 +3,8 @@ import streamlit as st
 import cv2
 import numpy as np
 import json
+from PIL import Image
+from io import BytesIO
 from calc import MinimalSafeHeight
 from streamlit_drawable_canvas import st_canvas
 
@@ -40,12 +42,15 @@ st.header("Загрузка карты высот")
 uploaded_file = st.file_uploader("Выберите изображение карты (PNG, JPG)", type=["png", "jpg", "jpeg"])
 
 if uploaded_file is not None:
-    # Загружаем изображение в numpy array
+    # Загружаем изображение в numpy array для OpenCV
     file_bytes = np.asarray(bytearray(uploaded_file.read()), dtype=np.uint8)
     img = cv2.imdecode(file_bytes, cv2.IMREAD_COLOR)
     img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
     img_gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
     h, w = img.shape[:2]
+    
+    # Создаём PIL Image для canvas
+    pil_img = Image.open(BytesIO(uploaded_file.getvalue()))
     
     st.write(f"**Размер изображения: {w}x{h} пикселей**")
     
@@ -67,9 +72,9 @@ if uploaded_file is not None:
             fill_color="rgba(255, 0, 0, 0.5)",
             stroke_width=3,
             stroke_color="#00FF00",
-            background_image=uploaded_file,
-            height=min(h, 600),
-            width=min(w, 800),
+            background_image=pil_img,
+            height=h,
+            width=w,
             drawing_mode="point",
             key="canvas",
             display_toolbar=True
@@ -86,10 +91,7 @@ if uploaded_file is not None:
                 if obj.get("type") == "circle":
                     x = int(obj.get("left", 0))
                     y = int(obj.get("top", 0))
-                    # Масштабирование координат если canvas меньше оригинала
-                    scale_x = w / min(w, 800)
-                    scale_y = h / min(h, 600)
-                    points.append((int(x * scale_x), int(y * scale_y)))
+                    points.append((x, y))
             
             st.session_state.points = points
         
